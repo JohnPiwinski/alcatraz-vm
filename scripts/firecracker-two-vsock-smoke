@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+fc=${FIRECRACKER_BIN:-$HOME/firecracker/firecracker-v1.16.1-x86_64}
+build=$root/.image-build
+run=$build/two-vsock
+mkdir -p "$run"
+
+test -x "$fc"
+test -f "$build/debian-vmlinux"
+test -f "$build/debian-kernel-modules.tgz"
+
+cc=${CC:-cc}
+"$cc" -O2 -Wall -Wextra -static "$root/guest/vsock-echo.c" -o "$run/vsock-echo"
+"$cc" -O2 -Wall -Wextra -static "$root/guest/vsock-client.c" -o "$run/vsock-client"
+
+make_initrd() {
+  local out=$1 binary=$2 init=$3 stage
+  stage=$(mktemp -d "$run/initrd.XXXXXX")
+  trap 'rm -rf "$stage"' RETURN
+  mkdir -p "$stage"/{bin,dev,etc,proc,sys,lib}
+  cp /usr/bin/busybox "$stage/bin/busybox"
+  ln -s busybox "$stage/bin/sh"
+  ln -s busybox "$stage/bin/insmod"
+  ln -s busybox "$stage/bin/mount"
+  ln -s busybox "$stage/bin/dmesg"
+  ln -s busybox "$stage/bin/grep"
+  ln -s busybox "$stage/bin/tail"
+  ln -s busybox "$stage/bin/ls"
+  cp "$binary" "$stage/bin/vsock-app"
+  ln -s vsock-app "$stage/bin/vsock-echo"
+  ln -s vsock-app "$stage/bin/vsock-client"
+  cp "$init" "$stage/init"
+  chmod 0755 "$stage/init" "$stage/bin/vsock-app"
+  tar -xzf "$build/debian-kernel-modules.tgz" -C "$stage" --wildcards \
+    'modules/*/modules.dep' \
+    'modules/*/kernel/drivers/virtio/virtio_mmio.ko.xz' \
+    'modules/*/kernel/net/vmw_vsock/vsock.ko.xz' \
+    'modules/*/kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko.xz' \
+    'modules/*/kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.xz'
+  mv "$stage/modules" "$stage/lib/modules"
+  find "$stage/lib/modules" -type f -name '*.ko.xz' -exec unxz {} \;
+  (cd "$stage" && find . -print | cpio -o -H newc --quiet | gzip -9 > "$out")
+  rm -rf "$stage"
+  trap - RETURN
+}
+
+make_initrd "$run/codex-initramfs.cpio.gz" "$run/vsock-echo" "$root/guest/vsock-init"
+make_initrd "$run/vibe-initramfs.cpio.gz" "$run/vsock-client" "$root/guest/vsock-client-init"
+
+codex_uds=$run/codex.vsock
+vibe_uds=$run/vibe.vsock
+bridge_vibe_uds=${vibe_uds}_7001
+rm -f "$codex_uds" "$vibe_uds" "$bridge_vibe_uds"
+
+cleanup() {
+  set +e
+  test -z "${vp:-}" || kill "$vp" 2>/dev/null
+  test -z "${bp:-}" || kill "$bp" 2>/dev/null
+  test -z "${cpid:-}" || kill "$cpid" 2>/dev/null
+  wait 2>/dev/null
+}
+trap cleanup EXIT
+vp= bp= cpid=
+
+cat > "$run/codex.json" <<EOF
+{"boot-source":{"kernel_image_path":"$build/debian-vmlinux","initrd_path":"$run/codex-initramfs.cpio.gz","boot_args":"console=ttyS0 reboot=k panic=1 pci=off"},"drives":[{"drive_id":"rootfs","path_on_host":"$build/debian-minbase-rootfs.ext4","is_root_device":true,"is_read_only":true}],"machine-config":{"vcpu_count":1,"mem_size_mib":256,"smt":false},"vsock":{"guest_cid":201,"uds_path":"$codex_uds"},"logger":{"log_path":"$run/codex.log","level":"Warning","show_level":true,"show_log_origin":false}}
+EOF
+
+"$fc" --no-api --config-file "$run/codex.json" > "$run/codex.serial.log" 2>&1 &
+cpid=$!
+for _ in $(seq 1 100); do
+  grep -q 'ALCATRAZ_VSOCK_LISTENING port=7000' "$run/codex.serial.log" && break
+  kill -0 "$cpid" 2>/dev/null || { cat "$run/codex.serial.log"; exit 1; }
+  sleep 0.1
+done
+grep -q 'ALCATRAZ_VSOCK_LISTENING port=7000' "$run/codex.serial.log"
+
+python3 "$root/scripts/vsock-bridge.py" "$codex_uds" "$vibe_uds" > "$run/bridge.log" 2>&1 &
+bp=$!
+for _ in $(seq 1 100); do
+  test -S "$bridge_vibe_uds" && break
+  kill -0 "$bp" 2>/dev/null || { cat "$run/bridge.log"; exit 1; }
+  sleep 0.1
+done
+test -S "$bridge_vibe_uds"
+
+cat > "$run/vibe.json" <<EOF
+{"boot-source":{"kernel_image_path":"$build/debian-vmlinux","initrd_path":"$run/vibe-initramfs.cpio.gz","boot_args":"console=ttyS0 reboot=k panic=1 pci=off"},"drives":[{"drive_id":"rootfs","path_on_host":"$build/debian-minbase-rootfs.ext4","is_root_device":true,"is_read_only":true}],"machine-config":{"vcpu_count":1,"mem_size_mib":256,"smt":false},"vsock":{"guest_cid":202,"uds_path":"$vibe_uds"},"logger":{"log_path":"$run/vibe.log","level":"Warning","show_level":true,"show_log_origin":false}}
+EOF
+
+"$fc" --no-api --config-file "$run/vibe.json" > "$run/vibe.serial.log" 2>&1 &
+vp=$!
+for _ in $(seq 1 100); do
+  grep -q 'ALCATRAZ_VSOCK_CLIENT_RESPONSE ALCATRAZ_VSOCK_ECHO vibe-to-codex' "$run/vibe.serial.log" && break
+  kill -0 "$vp" 2>/dev/null || { cat "$run/vibe.serial.log"; exit 1; }
+  sleep 0.1
+done
+grep -q 'ALCATRAZ_VSOCK_CLIENT_RESPONSE ALCATRAZ_VSOCK_ECHO vibe-to-codex' "$run/vibe.serial.log"
+echo 'two-guest-vsock: Vibe guest -> host broker -> Codex guest passed'

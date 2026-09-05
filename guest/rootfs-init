@@ -1,0 +1,26 @@
+#!/bin/sh
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+for module in \
+  /lib/modules/6.12.107+deb13-amd64/kernel/drivers/virtio/virtio_mmio.ko \
+  /lib/modules/6.12.107+deb13-amd64/kernel/drivers/block/virtio_blk.ko \
+  /lib/modules/6.12.107+deb13-amd64/kernel/fs/mbcache.ko \
+  /lib/modules/6.12.107+deb13-amd64/kernel/fs/jbd2/jbd2.ko \
+  /lib/modules/6.12.107+deb13-amd64/kernel/lib/crc16.ko \
+  /lib/modules/6.12.107+deb13-amd64/kernel/crypto/crc32c_generic.ko \
+  /lib/modules/6.12.107+deb13-amd64/kernel/lib/libcrc32c.ko \
+  /lib/modules/6.12.107+deb13-amd64/kernel/net/vmw_vsock/vsock.ko \
+  /lib/modules/6.12.107+deb13-amd64/kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko \
+  /lib/modules/6.12.107+deb13-amd64/kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko \
+  /lib/modules/6.12.107+deb13-amd64/kernel/fs/ext4/ext4.ko; do
+  /bin/busybox insmod "$module" 2>/dev/null || true
+done
+mkdir -p /newroot
+for _ in 1 2 3 4 5; do
+  mount -t ext4 /dev/vda /newroot 2>/dev/null && break
+  sleep 1
+done
+/bin/busybox mount | grep -q ' /newroot ' || { echo 'ALCATRAZ_ROOTFS_MOUNT_FAILED'; exec /bin/busybox sh; }
+echo 'ALCATRAZ_ROOTFS_MOUNT_OK'
+exec /bin/busybox switch_root /newroot /usr/sbin/alcatraz-init

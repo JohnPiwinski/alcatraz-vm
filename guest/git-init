@@ -1,0 +1,6 @@
+#!/bin/sh
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+echo ALCATRAZ_GIT_INIT_OK
+exec /usr/local/bin/vsock-exec 7003 /usr/local/bin/alcatraz-git-executor

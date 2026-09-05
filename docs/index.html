@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AlcatrazVM — setup book</title>
+  <style>
+    :root { color-scheme: dark; --bg:#111827; --panel:#1f2937; --ink:#e5e7eb; --muted:#9ca3af; --accent:#67e8f9; }
+    body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.6 system-ui,sans-serif; }
+    main { max-width:960px; margin:auto; padding:2rem 1.25rem 5rem; }
+    nav { position:sticky; top:0; background:rgba(17,24,39,.96); padding:.75rem 0; border-bottom:1px solid #374151; }
+    nav a { color:var(--accent); margin-right:1rem; }
+    h1,h2 { line-height:1.2; } h1 { font-size:2.4rem; } h2 { margin-top:3rem; color:var(--accent); }
+    pre { overflow:auto; background:#030712; border:1px solid #374151; border-radius:8px; padding:1rem; }
+    code { font-family:ui-monospace,monospace; } .note { background:var(--panel); border-left:4px solid var(--accent); padding:.75rem 1rem; }
+    li { margin:.35rem 0; }
+  </style>
+</head>
+<body>
+<main>
+  <nav><a href="#start">Start</a><a href="#build">Build</a><a href="#verify">Verify</a><a href="#operate">Operate</a><a href="#trouble">Troubleshoot</a></nav>
+  <h1>AlcatrazVM setup book</h1>
+  <p>AlcatrazVM is a four-role Firecracker/KVM isolation layout for VibeKanban,
+  Codex, Git, and Build. This book is a compact browser-readable companion to
+  <code>SECURE_AI_VM_ARCHITECTURE.md</code>.</p>
+  <p class="note"><strong>Important:</strong> the VM boots a verified Linux kernel
+  and minimal ext4 rootfs. It does not boot an ISO. Podman builds the userland;
+  it does not replace the kernel.</p>
+
+  <h2 id="start">1. Start with a capable host</h2>
+  <p>Use Linux x86-64 with readable <code>/dev/kvm</code>, Podman, jq, curl,
+  debugfs, mkfs.ext4, C, Git, and Cargo. The production Jailer also needs root
+  or equivalent mount-namespace capability. The existing <code>ms</code>
+  container is deliberately not used as a base image.</p>
+  <pre><code>test -r /dev/kvm
+podman --version
+/home/jpwin/firecracker/firecracker-v1.16.1-x86_64 --version
+/home/jpwin/firecracker/jailer-v1.16.1-x86_64 --version</code></pre>
+
+  <h2 id="build">2. Build minimal role images</h2>
+  <p>Build each clean, digest-pinned Debian role with Podman, convert its tar
+  export to ext4, inject only reviewed fixed executors, and seal the final
+  image. Use <code>scripts/build-sealed-role-rootfs-podman</code> for the
+  one-step version.</p>
+  <pre><code>mkdir -p .image-build/roles
+cargo build --bins
+scripts/build-sealed-role-rootfs-podman build \
+  "$PWD/.image-build/roles/alcatraz-build-rootfs.ext4" \
+  "$PWD/.image-build/debian-vmlinux"
+scripts/verify-image-contract build \
+  "$PWD/.image-build/roles/alcatraz-build-rootfs.ext4" \
+  "$PWD/.image-build/debian-vmlinux"</code></pre>
+  <p>Repeat for <code>vibe-kanban</code>, <code>codex</code>, and
+  <code>git</code>. The Vibe builder warms the pinned VibeKanban runtime and
+  confirms its internal port 3000 before export.</p>
+
+  <h2 id="verify">3. Verify before trusting a boot</h2>
+  <pre><code>scripts/verify-no-pci
+scripts/verify-role-boundaries
+scripts/integration-smoke</code></pre>
+  <p>The suite checks bounded typed protocol behavior, MMIO-only Firecracker
+  configuration, role-boundary negative checks, real KVM boots, two-VM vsock routing, VibeKanban host HTTP
+  200, Vibe↔Codex records, Git SSH-key injection and clone, Cargo, Git, and
+  reset. A successful boot by itself is not an isolation proof.</p>
+
+  <h2 id="emulator">4. Replace VibeKanban with the emulator</h2>
+  <p><code>vibe-codex-emulator</code> performs the fixed handshake and sends
+  only <code>submit-task</code>, <code>status</code>, or
+  <code>operator-review</code> records.</p>
+  <pre><code>cargo build --bin vibe-codex-emulator
+vibe-codex-emulator --socket /var/lib/alcatraz/run/codex.vsock \
+  submit-task 'Implement the sample project'
+scripts/vibe-emulator-smoke</code></pre>
+
+  <h2 id="subscriber">5. Run Codex with a ChatGPT subscription</h2>
+  <p>On the machine or VM that owns the second Codex process, run
+  <code>codex login</code> and choose <strong>Sign in with ChatGPT</strong>.
+  Keep its credential store private to Codex; never copy it into VibeKanban,
+  Git, or Build.</p>
+  <pre><code>codex login
+codex login status
+scripts/codex-subscriber-smoke</code></pre>
+  <p>For unattended service use, an approved API/service identity is required;
+  a ChatGPT subscription is not an API key.</p>
+  <p>The end-to-end sample defaults to the authenticated Codex CLI. Its fixed
+  provider allowlist also permits <code>ALCATRAZ_AGENT=opencode</code> when
+  installed; unknown providers are rejected.</p>
+
+  <h2 id="operate">6. Operate the jailed launcher</h2>
+  <pre><code>scripts/alcatraz-vm start build config/firecracker/build.json
+scripts/alcatraz-vm status build
+scripts/alcatraz-vm logs build
+scripts/alcatraz-vm stop build
+scripts/alcatraz-vm reset build</code></pre>
+  <p>The launcher accepts only fixed roles and matching repository configs. It
+  verifies sealed image sidecars, stages a private rootfs, and invokes Jailer
+  with a per-role chroot, UID/GID drop, PID namespace, and resource limit.
+  Unjailed mode requires both <code>ALCATRAZ_LAUNCH_MODE=unjailed</code> and
+  <code>ALCATRAZ_UNSAFE_UNJAILED=1</code>, and is for development only.</p>
+  <p>Build has no network device or default route. Git keys remain in the Git
+  VM. VibeKanban has no Codex key, Git key, host mount, or direct Git/Build
+  channel.</p>
+
+  <h2 id="trouble">7. Troubleshoot</h2>
+  <ul>
+    <li><strong>Jailer EPERM:</strong> run on a host/container with mount
+      namespace capability; do not silently switch to unjailed production.</li>
+    <li><strong>Vibe HTTP failure:</strong> inspect serial.log for the Vibe
+      server and fixed port-3000 proxy markers, then retry the host UDS path.</li>
+    <li><strong>Image contract failure:</strong> a kernel/rootfs or sidecar was
+      changed after sealing; rebuild and seal the final artifact.</li>
+    <li><strong>Cargo failure:</strong> confirm the fixed executor is current,
+      Cargo is at <code>/usr/bin/cargo</code>, and the workspace is inside the
+      Build root.</li>
+  </ul>
+  <p>For the complete command reference, provenance details, protocol policy,
+  and recovery procedure, read <a href="SETUP_TUTORIAL.md">SETUP_TUTORIAL.md</a>
+  and the architecture specification.</p>
+</main>
+</body>
+</html>

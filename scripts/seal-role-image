@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+[[ $# -eq 3 ]] || { echo 'usage: scripts/seal-role-image ROLE ROOTFS_EXT4 KERNEL' >&2; exit 2; }
+role=$1; rootfs=$2; kernel=$3
+case "$role" in vibe-kanban|codex|git|build) ;; *) echo 'unsupported role' >&2; exit 2 ;; esac
+[[ -f "$rootfs" && -f "$kernel" ]] || { echo 'rootfs and kernel must exist' >&2; exit 2; }
+[[ "$rootfs" == /* && "$rootfs" != *..* && "$kernel" == /* && "$kernel" != *..* ]] || { echo 'paths must be absolute and confined' >&2; exit 2; }
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+manifest="${rootfs}.manifest.json"
+digest_file="${rootfs}.manifest.sha256"
+sealed="${rootfs}.sealed.offline"
+rootfs_sha=$(sha256sum "$rootfs" | awk '{print $1}')
+kernel_sha=$(sha256sum "$kernel" | awk '{print $1}')
+provisioning_sha=$(sha256sum "$root/provision/provision-role.sh" | awk '{print $1}')
+
+tmp=$(mktemp "${manifest}.tmp.XXXXXX")
+cleanup() { rm -f "$tmp"; }
+trap cleanup EXIT
+printf '{"role":"%s","rootfs_sha256":"%s","kernel_sha256":"%s","provisioning_script_sha256":"%s","network_removed":true,"resolver_removed":true,"credentials_present":false,"pci_transport":false,"sealed":true}\n' \
+  "$role" "$rootfs_sha" "$kernel_sha" "$provisioning_sha" > "$tmp"
+mv -f -- "$tmp" "$manifest"
+sha256sum "$manifest" > "$digest_file"
+touch "$sealed"
+echo "sealed $role rootfs: $rootfs_sha"

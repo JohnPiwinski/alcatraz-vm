@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ $# -eq 2 ]] || { echo 'usage: scripts/tar-to-ext4 ROOTFS_TAR OUTPUT_EXT4' >&2; exit 2; }
+tarball=$1; image=$2
+[[ -f "$tarball" && "$image" == /* && "$image" != *..* && ! -e "$image" ]] || { echo 'invalid input or output' >&2; exit 2; }
+command -v mkfs.ext4 >/dev/null || { echo 'mkfs.ext4 is required' >&2; exit 1; }
+stage=$(mktemp -d)
+cleanup() { rm -rf "$stage"; }
+trap cleanup EXIT
+tar -xf "$tarball" -C "$stage"
+size=$(( $(du -sx --block-size=1 "$stage" | awk '{print $1}') + 128 * 1024 * 1024 ))
+truncate -s "$size" "$image"
+mkfs.ext4 -q -d "$stage" -F "$image"
+sha256sum "$image" > "$image.sha256"
+echo "wrote $image"

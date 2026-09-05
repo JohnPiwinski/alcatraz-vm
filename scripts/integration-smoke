@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+echo 'protocol:'; cargo test --quiet --manifest-path "$root/Cargo.toml"
+echo 'pci safety:'; "$root/scripts/verify-no-pci"
+echo 'role boundaries:'; "$root/scripts/verify-role-boundaries"
+echo 'image contracts:'; for role in codex git build; do "$root/scripts/verify-image-contract" "$role" "$root/.image-build/roles/alcatraz-$role-rootfs.ext4" "$root/.image-build/debian-vmlinux"; done; "$root/scripts/verify-image-contract" vibe-kanban "$root/.image-build/roles/alcatraz-vibe-rootfs.ext4" "$root/.image-build/debian-vmlinux"
+echo 'firecracker-vsock:'; "$root/scripts/firecracker-vsock-smoke"
+echo 'firecracker-two-vsock:'; "$root/scripts/firecracker-two-vsock-smoke"
+echo 'firecracker-vibe:'; "$root/scripts/firecracker-vibe-smoke"
+if command -v curl >/dev/null && curl --fail --silent --max-time 2 http://127.0.0.1:3030/health >/dev/null; then echo 'vibe-kanban: health ok'; else echo 'vibe-kanban: not running (expected without pinned service)'; fi
+echo 'codex pod channel:'; "$root/scripts/verify-vibe-codex"
+echo 'vibe emulator:'; "$root/scripts/vibe-emulator-smoke"
+echo 'git ssh:'; "$root/scripts/git-ssh-smoke"
+reset_runtime="$(mktemp -d)"; mkdir -p "$reset_runtime/build"; touch "$reset_runtime/build/pid"; ALCATRAZ_RUNTIME_ROOT="$reset_runtime" "$root/scripts/alcatraz-vm" reset build; test ! -e "$reset_runtime/build"; rmdir "$reset_runtime"; echo 'launcher: reset passed'
+echo 'role executors:'; "$root/scripts/role-executor-smoke"
+echo 'firecracker role executors:'; "$root/scripts/firecracker-role-executor-smoke" build; "$root/scripts/firecracker-role-executor-smoke" git
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+git init --quiet "$tmp/repo"; git -C "$tmp/repo" config user.email test@example.invalid; git -C "$tmp/repo" config user.name test; git -C "$tmp/repo" commit --allow-empty -m init --quiet; test -d "$tmp/repo/.git" && echo 'git: local repository ok'
+echo 'cargo: cargo test passed'

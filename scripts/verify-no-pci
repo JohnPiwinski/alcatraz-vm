@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+fc=${FIRECRACKER_BIN:-$HOME/firecracker/firecracker-v1.16.1-x86_64}
+test -x "$fc"
+version=$($fc --version | sed -n 's/.*Firecracker v\([^ ]*\).*/\1/p')
+[[ "$version" =~ ^1\.([0-9]+)\.([0-9]+)$ ]] || { echo 'unable to determine Firecracker version' >&2; exit 1; }
+minor=${BASH_REMATCH[1]}; patch=${BASH_REMATCH[2]}
+(( minor > 15 || (minor == 15 && patch >= 1) )) || { echo "Firecracker $version is below the patched 1.15.1 release" >&2; exit 1; }
+! rg -n -- '--enable-pci' "$root/scripts/alcatraz-vm" "$root/config/firecracker" >/dev/null
+for config in "$root"/config/firecracker/*.json; do
+  jq -e 'has("pci") | not' "$config" >/dev/null
+  jq -e '."boot-source".boot_args | contains("pci=off")' "$config" >/dev/null
+done
+echo "pci transport: disabled; Firecracker $version; virtio MMIO only"

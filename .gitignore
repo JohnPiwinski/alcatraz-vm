@@ -1,0 +1,20 @@
+# Generated VM images and sealed runtime artifacts
+/.image-build/
+/.runtime/
+
+# Local Rust build output
+/target/
+
+# Local/editor and machine-specific files
+.DS_Store
+*.swp
+*.swo
+
+# Credentials and private local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+id_ed25519*

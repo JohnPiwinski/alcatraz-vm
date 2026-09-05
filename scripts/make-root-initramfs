@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ $# -eq 1 ]] || { echo 'usage: scripts/make-root-initramfs OUTPUT' >&2; exit 2; }
+out=$1; root=$(cd "$(dirname "$0")/.." && pwd); build=$root/.image-build
+[[ "$out" == /* && "$out" != *..* && ! -e "$out" ]] || { echo 'output must be an unused absolute path without ..' >&2; exit 2; }
+stage=$(mktemp -d "$build/root-initrd.XXXXXX")
+cleanup() { rm -rf "$stage"; }
+trap cleanup EXIT
+mkdir -p "$stage"/{bin,dev,etc,lib,proc,sys,newroot}
+cp /usr/bin/busybox "$stage/bin/busybox"
+for applet in sh mount sleep switch_root grep; do ln -s busybox "$stage/bin/$applet"; done
+tar -xzf "$build/debian-kernel-modules.tgz" -C "$stage" --wildcards \
+  'modules/*/modules.dep' \
+  'modules/*/kernel/drivers/virtio/virtio_mmio.ko.xz' \
+  'modules/*/kernel/drivers/block/virtio_blk.ko.xz' \
+  'modules/*/kernel/fs/mbcache.ko.xz' \
+  'modules/*/kernel/fs/jbd2/jbd2.ko.xz' \
+  'modules/*/kernel/lib/crc16.ko.xz' \
+  'modules/*/kernel/crypto/crc32c_generic.ko.xz' \
+  'modules/*/kernel/lib/libcrc32c.ko.xz' \
+  'modules/*/kernel/net/vmw_vsock/vsock.ko.xz' \
+  'modules/*/kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko.xz' \
+  'modules/*/kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.xz' \
+  'modules/*/kernel/fs/ext4/ext4.ko.xz'
+mv "$stage/modules" "$stage/lib/modules"
+find "$stage/lib/modules" -type f -name '*.ko.xz' -exec unxz {} \;
+cp "$root/guest/rootfs-init" "$stage/init"; chmod 0755 "$stage/init"
+(cd "$stage" && find . -print | cpio -o -H newc --quiet | gzip -9 > "$out")
+echo "wrote $out"

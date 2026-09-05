@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+tmp=$(mktemp -d "$root/.image-build/executors.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+
+frame() {
+  local channel=$1 operation=$2 request=$3 nonce=$4 payload=$5 hash
+  payload=$(printf '%s' "$payload" | jq -S -c .)
+  hash=$(printf '%s' "$payload" | sha256sum | awk '{print $1}')
+  jq -S -c -n --arg channel "$channel" --arg operation "$operation" --arg request "$request" --arg nonce "$nonce" --arg hash "$hash" --argjson payload "$payload" \
+    '{version:1,channel:$channel,request_id:$request,operation:$operation,nonce:$nonce,payload_sha256:$hash,payload:$payload}'
+}
+
+build_payload=$(jq -S -c -n --arg workspace . --arg operation check --arg digest "$(printf 'a%.0s' {1..64})" '{workspace:$workspace,operation:$operation,bundle_sha256:$digest}')
+build_result=$(frame codex-to-build check build-smoke build-nonce "$build_payload" | ALCATRAZ_BUILD_ROOT="$root" "$root/target/debug/build-executor")
+printf '%s' "$build_result" | jq -e '.operation == "result" and .payload.success == true' >/dev/null
+
+git_repo="$tmp/repo"
+git init --quiet "$git_repo"
+git -C "$git_repo" config user.email test@example.invalid
+git -C "$git_repo" config user.name test
+git -C "$git_repo" commit --allow-empty --quiet -m init
+git -C "$git_repo" branch -M main
+git_payload=$(jq -S -c -n --arg repository "${git_repo#"$root"/}" --arg remote ssh://git.example/project --arg branch main '{repository:$repository,remote:$remote,branch:$branch,force:false}')
+git_result=$(frame codex-to-git status git-smoke git-nonce "$git_payload" | ALCATRAZ_GIT_ROOT="$root" "$root/target/debug/git-executor")
+printf '%s' "$git_result" | jq -e '.operation == "result" and .payload.operation == "status" and .payload.success == true' >/dev/null
+
+echo 'role executors: typed Build check and confined Git status passed'

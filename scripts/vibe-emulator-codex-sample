@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+agent="${ALCATRAZ_AGENT:-codex}"
+case "$agent" in
+  codex)
+    command -v codex >/dev/null || { echo 'codex CLI is required' >&2; exit 1; }
+    auth_status=$(codex login status 2>&1)
+    grep -q 'Logged in using ChatGPT' <<<"$auth_status" || {
+      echo 'Codex is not authenticated with ChatGPT; run codex login and choose Sign in with ChatGPT' >&2
+      exit 1
+    }
+    ;;
+  opencode)
+    command -v opencode >/dev/null || { echo 'ALCATRAZ_AGENT=opencode requested, but opencode is not installed' >&2; exit 1; }
+    ;;
+  *) echo 'ALCATRAZ_AGENT must be codex or opencode' >&2; exit 2 ;;
+esac
+sock=$(mktemp -u /tmp/alcatraz-vibe-codex-sample.XXXXXX.sock)
+sample=$(mktemp -d /tmp/alcatraz-codex-run.XXXXXX)
+cp -R "$root/guest/codex-sample-fixture/." "$sample/"
+cleanup() { kill "${server:-}" 2>/dev/null || true; wait "${server:-}" 2>/dev/null || true; rm -rf "$sample"; rm -f "$sock"; }
+trap cleanup EXIT
+python3 - "$sock" "$sample" "$agent" <<'PY' &
+import hashlib, json, os, socket, subprocess, sys
+path, sample, agent = sys.argv[1:]
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(path); listener.listen(1)
+try:
+    conn, _ = listener.accept()
+    with conn:
+        assert conn.recv(128) == b"CONNECT 7000\n"
+        conn.sendall(b"OK 9000\n")
+        raw = b""
+        while not raw.endswith(b"\n"):
+            raw += conn.recv(4096)
+        frame = json.loads(raw)
+        assert frame["channel"] == "vibe-to-codex"
+        assert frame["operation"] == "submit_task"
+        task = frame["payload"]["task"]
+        assert isinstance(task, str) and len(task) <= 2048
+        prompt = ("Complete the Rust sample in this project. Implement greet in src/lib.rs "
+                  "to return exactly Hello, <name>!, add useful tests, and run cargo test. "
+                  "The Vibe task was: " + task)
+        if agent == "codex":
+            command = ["codex", "-a", "never", "exec", "--ephemeral", "--skip-git-repo-check", "--sandbox", "workspace-write", prompt]
+        elif agent == "opencode":
+            command = ["opencode", "run", prompt]
+        else:
+            raise RuntimeError("unsupported fixed agent")
+        run = subprocess.run(command, cwd=sample, capture_output=True, text=True, timeout=180)
+        tests = subprocess.run(["cargo", "test"], cwd=sample, capture_output=True, text=True, timeout=30)
+        payload = {"accepted": run.returncode == 0, "agent_exit": run.returncode,
+                   "tests_passed": tests.returncode == 0 and "test result: ok" in (tests.stdout + tests.stderr),
+                   "request_id": frame["request_id"]}
+        encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+        response = {"version": 1, "channel": "codex-to-vibe", "request_id": frame["request_id"],
+                    "operation": "result" if payload["accepted"] and payload["tests_passed"] else "failure",
+                    "nonce": "response-" + frame["nonce"],
+                    "payload_sha256": hashlib.sha256(encoded).hexdigest(), "payload": payload}
+        conn.sendall(json.dumps(response, separators=(",", ":"), sort_keys=True).encode() + b"\n")
+finally:
+    listener.close()
+PY
+server=$!
+for _ in $(seq 1 100); do [[ -S "$sock" ]] && break; sleep .05; done
+result=$(cargo run --quiet --manifest-path "$root/Cargo.toml" --bin vibe-codex-emulator -- \
+  --socket "$sock" submit-task 'complete the sample project')
+jq -e '.accepted == true and .agent_exit == 0 and .tests_passed == true' <<<"$result" >/dev/null || {
+  echo "emulated Vibe→Codex sample failed: $result" >&2
+  exit 1
+}
+wait "$server"
+echo 'vibe emulator -> authenticated Codex -> sample project: Cargo tests passed'

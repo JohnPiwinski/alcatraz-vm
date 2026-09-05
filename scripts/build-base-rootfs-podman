@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ $# -eq 1 ]] || { echo 'usage: scripts/build-base-rootfs-podman OUTPUT_TAR' >&2; exit 2; }
+out="$1"; [[ "$out" == /* && "$out" != *..* ]] || { echo 'output must be an absolute path without ..' >&2; exit 2; }
+[[ ! -e "$out" ]] || { echo "output already exists: $out" >&2; exit 1; }
+command -v podman >/dev/null || { echo 'podman is required' >&2; exit 1; }
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+image="alcatraz-debian-base:local"
+podman build --file "$root/image/Containerfile" --tag "$image" "$root/image"
+podman save --format oci-archive --output "$out" "$image"
+sha256sum "$out" > "$out.sha256"
+podman image inspect "$image" --format '{"image":"{{.Id}}","created":"{{.Created}}"}' > "$out.manifest.json"
+echo "wrote $out"

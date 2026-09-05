@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+bin="${FIRECRACKER_BIN:-/home/jpwin/firecracker/firecracker-v1.16.1-x86_64}"
+art="$root/.image-build"
+[[ -x "$bin" ]] || { echo "Firecracker not found: $bin" >&2; exit 1; }
+for f in debian-vmlinux initramfs.cpio; do [[ -s "$art/$f" ]] || { echo "missing smoke artifact: $art/$f" >&2; exit 1; }; done
+run="$art/firecracker-initramfs-run"; rm -rf "$run"; mkdir -p "$run"
+python3 - "$run/config.json" "$art" <<'PY'
+import json, sys
+out, art = sys.argv[1:]
+json.dump({'boot-source': {'kernel_image_path': f'{art}/debian-vmlinux', 'initrd_path': f'{art}/initramfs.cpio', 'boot_args': 'console=ttyS0 reboot=k panic=1 pci=off rdinit=/init'}, 'drives': [], 'machine-config': {'vcpu_count': 1, 'mem_size_mib': 256, 'smt': False}, 'logger': {'log_path': f'{art}/firecracker-initramfs-run/firecracker.log', 'level': 'Info', 'show_level': True, 'show_log_origin': True}}, open(out, 'w'))
+PY
+"$bin" --api-sock "$run/api.sock" --config-file "$run/config.json" >"$run/serial.log" 2>"$run/stderr.log" &
+pid=$!
+cleanup() { kill -TERM "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
+trap cleanup EXIT
+for _ in {1..100}; do
+  [[ -S "$run/api.sock" ]] || { sleep 0.1; continue; }
+  curl --fail --silent --unix-socket "$run/api.sock" http://localhost/machine-config >/dev/null 2>&1 && break
+  sleep 0.1
+done
+for _ in {1..50}; do grep -q 'ALCATRAZ_GUEST_OFFLINE_OK' "$run/serial.log" && { echo 'firecracker: boot and offline checks passed'; exit 0; }; sleep 0.1; done
+echo 'firecracker: guest did not reach offline marker' >&2; tail -n 40 "$run/serial.log" >&2; exit 1

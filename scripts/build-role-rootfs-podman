@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ $# -eq 2 ]] || { echo 'usage: scripts/build-role-rootfs-podman ROLE OUTPUT_TAR' >&2; exit 2; }
+role=$1; out=$2
+case "$role" in vibe-kanban|codex|git|build) ;; *) echo "unsupported role: $role" >&2; exit 2;; esac
+[[ "$out" == /* && "$out" != *..* && ! -e "$out" ]] || { echo 'output must be an unused absolute path without ..' >&2; exit 2; }
+command -v podman >/dev/null || { echo 'podman is required' >&2; exit 1; }
+root=$(cd "$(dirname "$0")/.." && pwd)
+case "$role" in
+  vibe-kanban) file=VibeKanban.Containerfile; tag=alcatraz-vibe-kanban-rootfs:local ;;
+  codex) file=Codex.Containerfile; tag=alcatraz-codex-rootfs:local ;;
+  git) file=Git.Containerfile; tag=alcatraz-git-rootfs:local ;;
+  build) file=Build.Containerfile; tag=alcatraz-build-rootfs:local ;;
+esac
+podman build --file "$root/image/$file" --tag "$tag" "$root/image"
+container="alcatraz-rootfs-export-$role-$$"
+cleanup() { podman stop "$container" >/dev/null 2>&1 || true; podman rm "$container" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+podman create --name "$container" "$tag" >/dev/null
+if [[ "$role" == vibe-kanban ]]; then
+  podman start "$container" >/dev/null
+  healthy=0
+  for _ in $(seq 1 120); do
+    if podman exec "$container" node -e 'fetch("http://127.0.0.1:3000/").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))' >/dev/null 2>&1; then healthy=1; break; fi
+    sleep 1
+  done
+  [[ "$healthy" == 1 ]] || { podman logs "$container" >&2; echo 'VibeKanban did not become healthy inside the image' >&2; exit 1; }
+  podman exec "$container" sh -lc 'cp /tmp/vibe-home/.vibe-kanban/bin/v0.1.44-*/linux-x64/vibe-kanban /home/node/vibe-kanban-runtime && chmod 0755 /home/node/vibe-kanban-runtime'
+  warmed_tag="${tag}-warmed-$$"
+  podman commit "$container" "$warmed_tag" >/dev/null
+  podman stop "$container" >/dev/null
+  podman rm "$container" >/dev/null
+  container="${container}-export"
+  podman create --user 0 --name "$container" "$warmed_tag" >/dev/null
+  podman cp "$root/image/vibe-init" "$container:/usr/sbin/alcatraz-init"
+fi
+podman export --output "$out" "$container"
+sha256sum "$out" > "$out.sha256"
+printf '{"role":"%s","image":"%s","rootfs_sha256":"%s"}\n' "$role" "$tag" "$(awk '{print $1}' "$out.sha256")" > "$out.manifest.json"
+echo "wrote $out"

@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ $# -eq 2 ]] || { echo 'usage: scripts/inject-role-executors ROLE ROOTFS_EXT4' >&2; exit 2; }
+role=$1; image=$2
+case "$role" in codex|git|build) ;; *) echo 'executor injection supports codex, git, and build' >&2; exit 2;; esac
+[[ -f "$image" ]] || { echo 'rootfs image does not exist' >&2; exit 2; }
+command -v debugfs >/dev/null || { echo 'debugfs is required' >&2; exit 1; }
+root=$(cd "$(dirname "$0")/.." && pwd)
+case "$role" in
+  git) binary="$root/target/debug/git-executor"; name=alcatraz-git-executor ;;
+  build) binary="$root/target/debug/build-executor"; name=alcatraz-build-executor ;;
+  codex) binary="$root/target/debug/vibe-codex-demo"; name=alcatraz-codex-channel-demo ;;
+esac
+[[ -x "$binary" ]] || { echo "missing executable: $binary (run cargo build --bins)" >&2; exit 1; }
+debugfs -w -R 'mkdir /usr/local' "$image" >/dev/null 2>&1 || true
+debugfs -w -R 'mkdir /usr/local/bin' "$image" >/dev/null 2>&1 || true
+debugfs -w -R "write $binary /usr/local/bin/$name" "$image" >/dev/null
+debugfs -w -R "set_inode_field /usr/local/bin/$name mode 0100755" "$image" >/dev/null
+sha256sum "$image" > "$image.sha256"
+echo "injected $name into $image"

@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+git init --bare --quiet "$tmp/origin.git"
+git init --quiet "$tmp/source"
+git -C "$tmp/source" config user.email test@example.invalid
+git -C "$tmp/source" config user.name test
+printf 'alcatraz git proof\n' > "$tmp/source/README"
+git -C "$tmp/source" add README
+git -C "$tmp/source" commit --quiet -m initial
+git -C "$tmp/source" remote add origin "$tmp/origin.git"
+git -C "$tmp/source" push --quiet origin HEAD
+
+git_home="$tmp/git-vm-home"
+mkdir -p "$git_home/.ssh"
+ssh-keygen -q -t ed25519 -N '' -C alcatraz-test -f "$tmp/injected-key"
+install -m 0600 "$tmp/injected-key" "$git_home/.ssh/id_ed25519"
+install -m 0644 "$tmp/injected-key.pub" "$git_home/.ssh/id_ed25519.pub"
+chmod 0700 "$git_home/.ssh"
+
+GIT_CONFIG_NOSYSTEM=1 HOME="$git_home" git clone --quiet "$tmp/origin.git" "$tmp/clone"
+test "$(cat "$tmp/clone/README")" = 'alcatraz git proof'
+test "$(stat -c '%a' "$git_home/.ssh/id_ed25519")" = 600
+test "$(stat -c '%a' "$git_home/.ssh")" = 700
+test -s "$git_home/.ssh/id_ed25519"
+echo 'git: clone passed; SSH key injected into isolated Git VM home with 0700/0600 permissions'

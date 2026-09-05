@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Constrained Firecracker launcher for local bring-up and debugging.
+# It accepts a role name, not arbitrary Firecracker arguments.
+
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+RUNTIME_ROOT="${ALCATRAZ_RUNTIME_ROOT:-${ROOT_DIR}/.runtime}"
+FIRECRACKER_BIN="${FIRECRACKER_BIN:-/home/jpwin/firecracker/firecracker-v1.16.1-x86_64}"
+JAILER_BIN="${ALCATRAZ_JAILER_BIN:-${FIRECRACKER_BIN%/*}/jailer-v1.16.1-x86_64}"
+LAUNCH_MODE="${ALCATRAZ_LAUNCH_MODE:-jailed}"
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+usage() {
+  cat >&2 <<'EOF'
+usage:
+  scripts/alcatraz-vm start <role> <config.json>
+  scripts/alcatraz-vm status <role>
+  scripts/alcatraz-vm logs <role> [follow]
+  scripts/alcatraz-vm stop <role>
+  scripts/alcatraz-vm reset <role>
+
+roles: vibe-kanban codex git build
+EOF
+  exit 2
+}
+
+role_dir() {
+  case "$1" in
+    vibe-kanban|codex|git|build) printf '%s/%s' "$RUNTIME_ROOT" "$1" ;;
+    *) die "unsupported role: $1" ;;
+  esac
+}
+
+require_role() { [[ $# -eq 1 ]] || usage; role_dir "$1" >/dev/null; }
+pid_file() { printf '%s/pid' "$(role_dir "$1")"; }
+api_socket() { printf '%s/firecracker.api.sock' "$(role_dir "$1")"; }
+vsock_socket() { printf '%s/%s.vsock' "$(role_dir "$1")" "$1"; }
+stderr_log() { printf '%s/firecracker.stderr.log' "$(role_dir "$1")"; }
+serial_log() { printf '%s/serial.log' "$(role_dir "$1")"; }
+
+jail_id() { printf 'alcatraz-%s' "$1"; }
+jail_root() {
+  local role="$1" base
+  base="$(role_dir "$role")/jailer/$(basename -- "$FIRECRACKER_BIN")/$(jail_id "$role")/root"
+  printf '%s' "$base"
+}
+jail_api_socket() { printf '%s/var/lib/alcatraz/run/firecracker.api.sock' "$(jail_root "$1")"; }
+
+api_socket_for_role() {
+  if [[ "$LAUNCH_MODE" == jailed ]]; then jail_api_socket "$1"; else api_socket "$1"; fi
+}
+
+verify_image_contract() {
+  local role="$1" config="$2" kernel rootfs initrd
+  kernel="${ALCATRAZ_KERNEL_PATH:-$ROOT_DIR/.image-build/debian-vmlinux}"
+  rootfs="${ALCATRAZ_ROOTFS_PATH:-$ROOT_DIR/.image-build/roles/alcatraz-$role-rootfs.ext4}"
+  [[ -x "${ALCATRAZ_IMAGE_CONTRACT_VERIFIER:-$ROOT_DIR/scripts/verify-image-contract}" ]] || die 'image contract verifier is unavailable'
+  [[ -f "$kernel" ]] || die "verified kernel artifact is unavailable: $kernel"
+  [[ -f "$rootfs" ]] || die "verified $role rootfs artifact is unavailable: $rootfs"
+  initrd="${ALCATRAZ_INITRAMFS_PATH:-$ROOT_DIR/.image-build/root-initramfs.cpio.gz}"
+  [[ -f "$initrd" ]] || die "verified root initramfs artifact is unavailable: $initrd"
+  "${ALCATRAZ_IMAGE_CONTRACT_VERIFIER:-$ROOT_DIR/scripts/verify-image-contract}" "$role" "$rootfs" "$kernel"
+}
+
+is_running() {
+  local role="$1" pid
+  if firecracker_pids "$role" | grep -q .; then return 0; fi
+  [[ -r "$(pid_file "$role")" ]] || return 1
+  read -r pid < "$(pid_file "$role")"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+firecracker_pids() {
+  local role="$1" runtime
+  runtime="$(role_dir "$role")"
+  ps -eo pid=,args= | awk -v role="$role" -v mode="$LAUNCH_MODE" -v runtime="$runtime" '
+    {
+      pid=$1; $1=""; command=$0
+      if (mode == "jailed" && index(command, "--id alcatraz-" role) && index(command, "--config-file /var/lib/alcatraz/config.json")) print pid
+      if (mode == "unjailed" && index(command, "--api-sock " runtime "/firecracker.api.sock") && index(command, "--config-file " runtime "/config.json")) print pid
+    }
+  ' | sort -nu
+}
+
+start_vm() {
+  [[ $# -eq 2 ]] || usage
+  local role="$1" config="$2" config_realpath dir pid kernel rootfs initrd root_in_jail rootfs_in_jail config_in_jail config_to_launch uid gid
+  dir="$(role_dir "$role")"
+  [[ -x "$FIRECRACKER_BIN" ]] || die "Firecracker binary is not executable: $FIRECRACKER_BIN"
+  [[ -f "$config" ]] || die "configuration does not exist: $config"
+  config_realpath="$(realpath -- "$config")"
+  [[ "$config_realpath" == "$ROOT_DIR/config/firecracker/"*.json ]] || die "configuration must be a repository role configuration"
+  [[ "$(basename -- "$config_realpath")" == "$role.json" ]] || die "configuration does not match role"
+  jq -e '(."boot-source" | type == "object") and (."machine-config" | type == "object") and (.logger | type == "object") and (.vsock | type == "object") and (.drives | length == 1) and (."boot-source".kernel_image_path | type == "string" and startswith("/var/lib/alcatraz/images/")) and (.drives[0].path_on_host | type == "string" and startswith("/var/lib/alcatraz/images/")) and (.vsock.uds_path | type == "string" and startswith("/var/lib/alcatraz/run/")) and (.logger.log_path | type == "string" and startswith("/var/lib/alcatraz/logs/"))' "$config_realpath" >/dev/null || die "configuration failed fixed-path/schema validation"
+  grep -q '"boot-source"' "$config_realpath" || die "configuration is missing boot-source"
+  grep -q '"machine-config"' "$config_realpath" || die "configuration is missing machine-config"
+  grep -q '"logger"' "$config_realpath" || die "configuration is missing logger"
+  grep -q '"vsock"' "$config_realpath" || die "configuration is missing vsock"
+  case "$role" in
+    vibe-kanban) grep -q '"guest_cid":101' "$config" || die "vibe-kanban config has wrong guest CID" ;;
+    codex) grep -q '"guest_cid":102' "$config" || die "codex config has wrong guest CID" ;;
+    git) grep -q '"guest_cid":103' "$config" || die "git config has wrong guest CID" ;;
+    build) grep -q '"guest_cid":104' "$config" || die "build config has wrong guest CID" ;;
+  esac
+  verify_image_contract "$role" "$config_realpath"
+  is_running "$role" && die "$role is already running"
+  mkdir -p "$dir"
+  rm -f "$(api_socket_for_role "$role")" "$(pid_file "$role")"
+  kernel="${ALCATRAZ_KERNEL_PATH:-$ROOT_DIR/.image-build/debian-vmlinux}"
+  rootfs="${ALCATRAZ_ROOTFS_PATH:-$ROOT_DIR/.image-build/roles/alcatraz-$role-rootfs.ext4}"
+  initrd="${ALCATRAZ_INITRAMFS_PATH:-$ROOT_DIR/.image-build/root-initramfs.cpio.gz}"
+
+  if [[ "$LAUNCH_MODE" == jailed ]]; then
+    [[ -x "$JAILER_BIN" ]] || die "Jailer binary is not executable: $JAILER_BIN"
+    [[ "$(id -u)" == 0 ]] || die 'jailed startup requires root for chroot, mount namespace, UID/GID drop, and cgroup setup'
+    uid="${ALCATRAZ_VM_UID:-65534}"; gid="${ALCATRAZ_VM_GID:-65534}"
+    [[ "$uid" =~ ^[0-9]+$ && "$gid" =~ ^[0-9]+$ ]] || die 'ALCATRAZ_VM_UID/GID must be numeric'
+    root_in_jail="$(jail_root "$role")"
+    mkdir -p "$root_in_jail/var/lib/alcatraz/images" "$root_in_jail/var/lib/alcatraz/run" "$root_in_jail/var/lib/alcatraz/logs"
+    cp --reflink=auto -- "$kernel" "$root_in_jail/var/lib/alcatraz/images/common-vmlinux"
+    cp --reflink=auto -- "$initrd" "$root_in_jail/var/lib/alcatraz/images/root-initramfs.cpio.gz"
+    rootfs_in_jail="$root_in_jail/var/lib/alcatraz/images/$(basename -- "$(jq -r '.drives[0].path_on_host' "$config_realpath")")"
+    cp --reflink=auto -- "$rootfs" "$rootfs_in_jail"
+    config_in_jail="$root_in_jail/var/lib/alcatraz/config.json"
+    cp -- "$config_realpath" "$config_in_jail"
+    chown -R "$uid:$gid" "$root_in_jail/var/lib/alcatraz"
+    chmod 0755 "$root_in_jail/var/lib/alcatraz" "$root_in_jail/var/lib/alcatraz/images" "$root_in_jail/var/lib/alcatraz/run" "$root_in_jail/var/lib/alcatraz/logs"
+    "$JAILER_BIN" --exec-file "$FIRECRACKER_BIN" --id "$(jail_id "$role")" \
+      --uid "$uid" --gid "$gid" --chroot-base-dir "$dir/jailer" --new-pid-ns \
+      --resource-limit no-file=4096 ${ALCATRAZ_JAILER_PARENT_CGROUP:+--parent-cgroup "$ALCATRAZ_JAILER_PARENT_CGROUP"} -- \
+      --api-sock /var/lib/alcatraz/run/firecracker.api.sock --config-file /var/lib/alcatraz/config.json \
+      >"$(serial_log "$role")" 2>"$(stderr_log "$role")" &
+  elif [[ "$LAUNCH_MODE" == unjailed && "${ALCATRAZ_UNSAFE_UNJAILED:-0}" == 1 ]]; then
+    config_to_launch="$dir/config.json"
+    jq --arg kernel "$kernel" --arg initrd "$initrd" --arg rootfs "$rootfs" --arg socket "$(vsock_socket "$role")" \
+      --arg log "$(serial_log "$role")" \
+      '."boot-source".kernel_image_path=$kernel | ."boot-source".initrd_path=$initrd | .drives[0].path_on_host=$rootfs | .vsock.uds_path=$socket | .logger.log_path=$log' \
+      "$config_realpath" > "$config_to_launch"
+    "$FIRECRACKER_BIN" --api-sock "$(api_socket_for_role "$role")" --config-file "$config_to_launch" \
+      >"$(serial_log "$role")" 2>"$(stderr_log "$role")" &
+  else
+    die 'unsupported launch mode; use jailed or explicitly set ALCATRAZ_LAUNCH_MODE=unjailed ALCATRAZ_UNSAFE_UNJAILED=1 for development'
+  fi
+  pid=$!
+  printf '%s\n' "$pid" > "$(pid_file "$role")"
+  printf 'started %s (pid %s)\nserial: %s\nstderr: %s\napi: %s\n' \
+    "$role" "$pid" "$(serial_log "$role")" "$(stderr_log "$role")" "$(api_socket_for_role "$role")"
+}
+
+status_vm() {
+  require_role "$1"
+  if is_running "$1"; then
+    printf '%s: running (pid ' "$1"; cat "$(pid_file "$1")"; printf ')\n'
+  else
+    printf '%s: stopped\n' "$1"
+    [[ -s "$(stderr_log "$1")" ]] && printf 'last stderr: %s\n' "$(stderr_log "$1")"
+    return 1
+  fi
+}
+
+logs_vm() {
+  require_role "$1"
+  local role="$1"
+  if [[ "${2:-}" == "follow" ]]; then
+    tail -n 100 -F "$(serial_log "$role")" "$(stderr_log "$role")"
+  else
+    for file in "$(serial_log "$role")" "$(stderr_log "$role")"; do
+      printf '\n--- %s ---\n' "$file"
+      [[ -f "$file" ]] && tail -n 100 "$file" || printf '(not created)\n'
+    done
+  fi
+}
+
+stop_vm() {
+  require_role "$1"
+  local role="$1" pid pids
+  pids="$(firecracker_pids "$role")"
+  if [[ -r "$(pid_file "$role")" ]]; then
+    read -r pid < "$(pid_file "$role")" || true
+    [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && pids="$pids\n$pid"
+  fi
+  pids="$(printf '%b\n' "$pids" | awk 'NF' | sort -nu)"
+  [[ -n "$pids" ]] || { printf '%s: already stopped\n' "$role"; return 0; }
+  while read -r pid; do kill -TERM "$pid" 2>/dev/null || true; done <<< "$pids"
+  for _ in {1..50}; do
+    alive=""
+    while read -r pid; do kill -0 "$pid" 2>/dev/null && alive="$alive $pid"; done <<< "$pids"
+    [[ -z "$alive" ]] && break
+    sleep 0.1
+  done
+  alive=""
+  while read -r pid; do kill -0 "$pid" 2>/dev/null && alive="$alive $pid"; done <<< "$pids"
+  if [[ -n "$alive" ]]; then
+    for pid in $alive; do kill -KILL "$pid" 2>/dev/null || true; done
+    die "$role did not stop cleanly (PIDs:$alive)"
+  fi
+  rm -f "$(pid_file "$role")" "$(api_socket_for_role "$role")"
+  printf 'stopped %s\n' "$role"
+}
+
+reset_vm() {
+  require_role "$1"
+  local role="$1" dir
+  dir="$(role_dir "$role")"
+  if is_running "$role"; then stop_vm "$role"; fi
+  if [[ -e "$dir" ]]; then
+    rm -rf -- "$dir"
+  fi
+  [[ ! -e "$dir" ]] || die "$role runtime directory was not removed"
+  printf 'reset %s (runtime state removed; next start requires fresh verified image state)\n' "$role"
+}
+
+[[ $# -ge 2 ]] || usage
+command="$1"; shift
+case "$command" in
+  start) start_vm "$@" ;;
+  status) status_vm "$@" ;;
+  logs) logs_vm "$@" ;;
+  stop) stop_vm "$@" ;;
+  reset) reset_vm "$@" ;;
+  *) usage ;;
+esac

@@ -1,0 +1,12 @@
+#!/bin/sh
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
+for module in \
+  /lib/modules/6.12.107+deb13-amd64/kernel/drivers/virtio/virtio_mmio.ko \
+  /lib/modules/6.12.107+deb13-amd64/kernel/net/vmw_vsock/vsock.ko \
+  /lib/modules/6.12.107+deb13-amd64/kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko \
+  /lib/modules/6.12.107+deb13-amd64/kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko; do
+  /bin/busybox insmod "$module" 2>/dev/null || true
+done
+echo 'ALCATRAZ_VSOCK_CLIENT_INIT_OK'
+exec /bin/vsock-client

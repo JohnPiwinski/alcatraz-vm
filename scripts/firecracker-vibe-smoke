@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+fc=${FIRECRACKER_BIN:-$HOME/firecracker/firecracker-v1.16.1-x86_64}
+build=$root/.image-build
+run=$build/vibe-firecracker-run
+mkdir -p "$run"
+test -x "$fc"; test -f "$build/debian-vmlinux"; test -f "$build/roles/alcatraz-vibe-rootfs.ext4"
+cc=${CC:-cc}; "$cc" -O2 -Wall -Wextra -static "$root/guest/vsock-tcp-proxy.c" -o "$run/vsock-tcp-proxy"
+if [[ ! -f "$build/vibe-root-initramfs.cpio.gz" ]]; then
+  "$root/scripts/make-root-initramfs" "$build/vibe-root-initramfs.cpio.gz"
+fi
+cp "$build/roles/alcatraz-vibe-rootfs.ext4" "$run/rootfs.ext4"
+debugfs -w -R 'rm /usr/local/bin/vsock-tcp-proxy' "$run/rootfs.ext4" >/dev/null 2>&1 || true
+debugfs -w -R "write $run/vsock-tcp-proxy /usr/local/bin/vsock-tcp-proxy" "$run/rootfs.ext4" >/dev/null
+debugfs -w -R 'set_inode_field /usr/local/bin/vsock-tcp-proxy mode 0100755' "$run/rootfs.ext4" >/dev/null
+rm -f "$run/vibe.vsock"
+cat > "$run/config.json" <<EOF
+{"boot-source":{"kernel_image_path":"$build/debian-vmlinux","initrd_path":"$build/vibe-root-initramfs.cpio.gz","boot_args":"console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw"},"drives":[{"drive_id":"rootfs","path_on_host":"$run/rootfs.ext4","is_root_device":true,"is_read_only":false}],"machine-config":{"vcpu_count":1,"mem_size_mib":1024,"smt":false},"vsock":{"guest_cid":301,"uds_path":"$run/vibe.vsock"},"logger":{"log_path":"$run/firecracker.log","level":"Warning","show_level":true,"show_log_origin":false}}
+EOF
+"$fc" --no-api --config-file "$run/config.json" > "$run/serial.log" 2> "$run/stderr.log" &
+pid=$!
+cleanup() { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
+trap cleanup EXIT
+for _ in $(seq 1 120); do
+  if grep -q 'ALCATRAZ_VIBE_INIT_OK' "$run/serial.log" && grep -q 'Main server on :3000' "$run/serial.log" && grep -q 'ALCATRAZ_VIBE_VSOCK_HTTP_LISTENING port=3000' "$run/serial.log"; then break; fi
+  kill -0 "$pid" 2>/dev/null || { tail -40 "$run/serial.log"; cat "$run/stderr.log"; exit 1; }
+  sleep 1
+done
+grep -q 'ALCATRAZ_VIBE_INIT_OK' "$run/serial.log"
+grep -q 'Main server on :3000' "$run/serial.log"
+grep -q 'ALCATRAZ_VIBE_VSOCK_HTTP_LISTENING port=3000' "$run/serial.log"
+sleep 2
+python3 - "$run/vibe.vsock" <<'PY'
+import socket, sys, time
+path = sys.argv[1]
+response = b""
+for attempt in range(10):
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(2)
+    try:
+        sock.connect(path)
+        sock.sendall(b"CONNECT 3000\n")
+        reply = b""
+        while not reply.endswith(b"\n"):
+            chunk = sock.recv(128)
+            if not chunk: raise OSError("CONNECT closed without OK")
+            reply += chunk
+        if not reply.startswith(b"OK "): raise OSError(f"unexpected CONNECT response: {reply!r}")
+        sock.sendall(b"GET / HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        while len(response) < 65536:
+            chunk = sock.recv(4096)
+            if not chunk: break
+            response += chunk
+    except (OSError, TimeoutError):
+        response = b""
+    finally:
+        sock.close()
+    if response.startswith(b"HTTP/1.1 200") or response.startswith(b"HTTP/1.0 200"): break
+    response = b""
+    time.sleep(0.5)
+if not response.startswith(b"HTTP/1.1 200") and not response.startswith(b"HTTP/1.0 200"):
+    raise SystemExit(f"unexpected Vibe HTTP response: {response[:128]!r}")
+print("host-http: Firecracker vsock CONNECT 3000 and VibeKanban HTTP 200 passed")
+PY
+echo 'firecracker-vibe: booted actual VibeKanban rootfs and server reached listening state'

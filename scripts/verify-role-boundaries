@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+for config in "$root"/config/firecracker/*.json; do
+  jq -e '
+    (has("network-interfaces") | not)
+    and (.drives | length == 1)
+    and (."machine-config".smt == false)
+    and (."boot-source".boot_args | contains("pci=off"))
+  ' "$config" >/dev/null || { echo "role config boundary failed: $config" >&2; exit 1; }
+done
+
+build_config="$root/config/firecracker/build.json"
+jq -e 'has("network-interfaces") | not' "$build_config" >/dev/null
+! rg -n '(^|[[:space:]])(ip|ifconfig|route)[[:space:]]' "$root/guest/build-init" >/dev/null
+
+for image in "$root"/.image-build/roles/*.ext4; do
+  [[ -f "$image" ]] || continue
+  for secret_path in /root/.ssh /root/.openai /run/secrets /home/node/.ssh; do
+    if debugfs -R "stat $secret_path" "$image" 2>&1 | rg -q '^Inode:'; then
+      echo "known credential path exists in image: $image:$secret_path" >&2
+      exit 1
+    fi
+  done
+done
+
+echo 'role boundaries: no NICs, no default network setup, and no known credential paths'

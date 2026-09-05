@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+[[ $# -eq 3 ]] || { echo 'usage: scripts/verify-image-contract ROLE ROOTFS_EXT4 KERNEL' >&2; exit 2; }
+role=$1; rootfs=$2; kernel=$3
+case "$role" in vibe-kanban|codex|git|build) ;; *) echo 'unsupported role' >&2; exit 2 ;; esac
+for path in "$rootfs" "$kernel" "${rootfs}.manifest.json" "${rootfs}.manifest.sha256" "${rootfs}.sealed.offline"; do
+  [[ -e "$path" ]] || { echo "missing sealed artifact: $path" >&2; exit 1; }
+done
+manifest_sha=$(sha256sum "${rootfs}.manifest.json" | awk '{print $1}')
+test "$manifest_sha" = "$(awk '{print $1}' "${rootfs}.manifest.sha256")" || { echo 'manifest digest mismatch' >&2; exit 1; }
+rootfs_sha=$(sha256sum "$rootfs" | awk '{print $1}')
+kernel_sha=$(sha256sum "$kernel" | awk '{print $1}')
+jq -e --arg role "$role" --arg rootfs "$rootfs_sha" --arg kernel "$kernel_sha" \
+  'type == "object" and .role == $role and .rootfs_sha256 == $rootfs and .kernel_sha256 == $kernel and .network_removed == true and .resolver_removed == true and .credentials_present == false and .pci_transport == false and .sealed == true' \
+  "${rootfs}.manifest.json" >/dev/null || { echo 'sealed image contract failed' >&2; exit 1; }
+echo "image contract: $role verified"

@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"; art="$root/.image-build"
+bin="${FIRECRACKER_BIN:-/home/jpwin/firecracker/firecracker-v1.16.1-x86_64}"
+[[ -x "$bin" ]] || { echo "Firecracker not found: $bin" >&2; exit 1; }
+command -v gcc >/dev/null || { echo 'gcc is required' >&2; exit 1; }
+for f in debian-vmlinux debian-kernel-modules.tgz; do [[ -s "$art/$f" ]] || { echo "missing artifact: $art/$f" >&2; exit 1; }; done
+gcc -static -O2 -Wall -Wextra "$root/guest/vsock-echo.c" -o "$art/vsock-echo"
+init="$art/vsock-initramfs"; rm -rf "$init"; mkdir -p "$init/bin" "$init/proc" "$init/sys" "$init/dev" "$init/run" "$init/lib/modules/6.12.107+deb13-amd64/kernel/drivers/virtio" "$init/lib/modules/6.12.107+deb13-amd64/kernel/net/vmw_vsock"
+cp /usr/bin/busybox "$init/bin/busybox"; for app in sh grep tail basename insmod dmesg ls; do ln -sf busybox "$init/bin/$app"; done
+cp "$art/vsock-echo" "$init/bin/vsock-echo"; cp "$root/guest/vsock-init" "$init/init"; chmod +x "$init/init"
+mods="$(mktemp -d)"; trap 'rm -rf "$mods"' EXIT; tar -xzf "$art/debian-kernel-modules.tgz" -C "$mods"
+for name in vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport; do cp "$mods/modules/6.12.107+deb13-amd64/kernel/net/vmw_vsock/$name.ko.xz" "$init/lib/modules/6.12.107+deb13-amd64/kernel/net/vmw_vsock/"; unxz "$init/lib/modules/6.12.107+deb13-amd64/kernel/net/vmw_vsock/$name.ko.xz"; done
+cp "$mods/modules/6.12.107+deb13-amd64/kernel/drivers/virtio/virtio_mmio.ko.xz" "$init/lib/modules/6.12.107+deb13-amd64/kernel/drivers/virtio/"; unxz "$init/lib/modules/6.12.107+deb13-amd64/kernel/drivers/virtio/virtio_mmio.ko.xz"
+(cd "$init" && find . -print0 | cpio --null -o -H newc > "$art/vsock-initramfs.cpio") >/dev/null 2>&1
+run="$art/vsock-firecracker-run"; rm -rf "$run"; mkdir -p "$run"
+python3 - "$run/config.json" "$art" <<'PY'
+import json,sys
+out,art=sys.argv[1:]
+json.dump({'boot-source':{'kernel_image_path':f'{art}/debian-vmlinux','initrd_path':f'{art}/vsock-initramfs.cpio','boot_args':'console=ttyS0 reboot=k panic=1 pci=off rdinit=/init'},'drives':[],'machine-config':{'vcpu_count':1,'mem_size_mib':256,'smt':False},'vsock':{'guest_cid':111,'uds_path':f'{art}/vsock-firecracker-run/guest.vsock'},'logger':{'log_path':f'{art}/vsock-firecracker-run/firecracker.log','level':'Info','show_level':True,'show_log_origin':True}},open(out,'w'))
+PY
+"$bin" --api-sock "$run/api.sock" --config-file "$run/config.json" >"$run/serial.log" 2>"$run/stderr.log" & pid=$!
+cleanup(){ kill -TERM "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }; trap cleanup EXIT
+for _ in {1..100}; do [[ -S "$run/guest.vsock" ]] && break; sleep .1; done; sleep 1
+python3 - "$run/guest.vsock" <<'PY'
+import socket,sys
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.settimeout(5); s.connect(sys.argv[1]); s.sendall(b'CONNECT 7000\n'); reply=b''
+while not reply.endswith(b'\n'): reply += s.recv(64)
+assert reply.startswith(b'OK '), reply
+s.sendall(b'vsock-ping'); expected=b'ALCATRAZ_VSOCK_ECHO vsock-ping'; data=b''
+while len(data) < len(expected): data += s.recv(len(expected) - len(data))
+assert data == expected, data
+print(f'firecracker-vsock: handshake={reply.decode().strip()} echo=passed')
+PY
+grep -q 'ALCATRAZ_VSOCK_LISTENING' "$run/serial.log"

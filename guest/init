@@ -1,0 +1,6 @@
+#!/bin/busybox sh
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
+echo 'ALCATRAZ_GUEST_BOOT_OK role=smoke'
+echo 'ALCATRAZ_GUEST_OFFLINE_OK'
+exec /bin/busybox sh

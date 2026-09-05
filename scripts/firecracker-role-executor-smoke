@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ $# -eq 1 ]] || { echo 'usage: scripts/firecracker-role-executor-smoke build|git' >&2; exit 2; }
+role=$1; root=$(cd "$(dirname "$0")/.." && pwd); build=$root/.image-build; run=$build/role-executor-$role
+mkdir -p "$run"; test -x "$HOME/firecracker/firecracker-v1.16.1-x86_64"; test -f "$build/debian-vmlinux"; test -f "$build/vibe-root-initramfs.cpio.gz"
+cc=${CC:-cc}; "$cc" -O2 -Wall -Wextra -static "$root/guest/vsock-exec.c" -o "$run/vsock-exec"
+cp "$build/roles/alcatraz-$role-rootfs.ext4" "$run/rootfs.ext4"
+if [[ "$role" == build ]]; then
+  init=$root/guest/build-init; executor=$root/target/debug/build-executor; port=7002; cid=401
+  debugfs -w -R 'mkdir /workspace' "$run/rootfs.ext4" >/dev/null 2>&1 || true
+  debugfs -w -R 'mkdir /workspace/src' "$run/rootfs.ext4" >/dev/null 2>&1 || true
+  debugfs -w -R "write $root/guest/build-fixture/Cargo.toml /workspace/Cargo.toml" "$run/rootfs.ext4" >/dev/null
+  debugfs -w -R "write $root/guest/build-fixture/src/main.rs /workspace/src/main.rs" "$run/rootfs.ext4" >/dev/null
+  payload=$(jq -S -c -n --arg workspace workspace --arg operation check --arg digest "$(printf 'a%.0s' {1..64})" '{workspace:$workspace,operation:$operation,bundle_sha256:$digest}')
+  expected='check'
+else
+  init=$root/guest/git-init; executor=$root/target/debug/git-executor; port=7003; cid=402
+  git_repo="$run/git-workspace/repos/app"; git init --quiet "$git_repo"; git -C "$git_repo" config user.email test@example.invalid; git -C "$git_repo" config user.name test; git -C "$git_repo" commit --allow-empty --quiet -m init; git -C "$git_repo" branch -M main
+  debugfs -w -R 'mkdir /workspace' "$run/rootfs.ext4" >/dev/null 2>&1 || true
+  while IFS= read -r dir; do
+    rel=${dir#"$run/git-workspace/"}
+    [[ "$rel" == "$dir" ]] && continue
+    debugfs -w -R "mkdir /workspace/$rel" "$run/rootfs.ext4" >/dev/null 2>&1 || true
+  done < <(find "$run/git-workspace" -type d | sort)
+  while IFS= read -r file; do
+    rel=${file#"$run/git-workspace/"}
+    debugfs -w -R "write $file /workspace/$rel" "$run/rootfs.ext4" >/dev/null
+  done < <(find "$run/git-workspace" -type f)
+  payload=$(jq -S -c -n --arg repository workspace/repos/app --arg remote ssh://git.example/project --arg branch main '{repository:$repository,remote:$remote,branch:$branch,force:false}')
+  expected='status'
+fi
+debugfs -w -R 'rm /usr/local/bin/vsock-exec' "$run/rootfs.ext4" >/dev/null 2>&1 || true
+debugfs -w -R "rm /usr/local/bin/alcatraz-$role-executor" "$run/rootfs.ext4" >/dev/null 2>&1 || true
+debugfs -w -R "write $run/vsock-exec /usr/local/bin/vsock-exec" "$run/rootfs.ext4" >/dev/null
+debugfs -w -R "write $executor /usr/local/bin/alcatraz-$role-executor" "$run/rootfs.ext4" >/dev/null
+debugfs -w -R "set_inode_field /usr/local/bin/vsock-exec mode 0100755" "$run/rootfs.ext4" >/dev/null
+debugfs -w -R "set_inode_field /usr/local/bin/alcatraz-$role-executor mode 0100755" "$run/rootfs.ext4" >/dev/null
+debugfs -w -R "rm /usr/sbin/alcatraz-init" "$run/rootfs.ext4" >/dev/null 2>&1 || true
+debugfs -w -R "write $init /usr/sbin/alcatraz-init" "$run/rootfs.ext4" >/dev/null
+debugfs -w -R 'set_inode_field /usr/sbin/alcatraz-init mode 0100755' "$run/rootfs.ext4" >/dev/null
+sha=$(printf '%s' "$payload" | sha256sum | awk '{print $1}')
+cat > "$run/config.json" <<EOF
+{"boot-source":{"kernel_image_path":"$build/debian-vmlinux","initrd_path":"$build/vibe-root-initramfs.cpio.gz","boot_args":"console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw"},"drives":[{"drive_id":"rootfs","path_on_host":"$run/rootfs.ext4","is_root_device":true,"is_read_only":false}],"machine-config":{"vcpu_count":1,"mem_size_mib":1024,"smt":false},"vsock":{"guest_cid":$cid,"uds_path":"$run/role.vsock"},"logger":{"log_path":"$run/firecracker.log","level":"Warning","show_level":true,"show_log_origin":false}}
+EOF
+rm -f "$run/role.vsock"; "$HOME/firecracker/firecracker-v1.16.1-x86_64" --no-api --config-file "$run/config.json" > "$run/serial.log" 2> "$run/stderr.log" & pid=$!
+cleanup() { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
+trap cleanup EXIT
+for _ in $(seq 1 100); do grep -q "ALCATRAZ_${role^^}_INIT_OK" "$run/serial.log" && break; kill -0 "$pid" 2>/dev/null || { cat "$run/serial.log"; exit 1; }; sleep 0.1; done
+python3 - "$run/role.vsock" "$payload" "$sha" "$expected" <<'PY'
+import json, socket, sys, time
+path, payload, sha, expected = sys.argv[1:]
+frame={"version":1,"channel":"codex-to-build" if expected=="check" else "codex-to-git","request_id":"role-smoke","operation":expected,"nonce":"role-nonce","payload_sha256":sha,"payload":json.loads(payload)}
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+for _ in range(100):
+    try: s.connect(path); break
+    except OSError: time.sleep(.1)
+else: raise SystemExit("vsock UDS unavailable")
+s.sendall(b"CONNECT %s\n" % (b"7002" if expected=="check" else b"7003"))
+assert s.recv(128).startswith(b"OK ")
+s.sendall((json.dumps(frame,separators=(",",":"),sort_keys=True)+"\n").encode())
+data=b""
+while b"\n" not in data and len(data)<16384:
+    part=s.recv(4096)
+    if not part: break
+    data+=part
+s.close(); result=json.loads(data.decode())
+assert result["operation"]=="result", result
+assert result["payload"]["operation"]==expected and result["payload"]["success"] is True, result
+print("role-executor: Firecracker %s %s passed" % (expected, result["payload"]["operation"]))
+PY

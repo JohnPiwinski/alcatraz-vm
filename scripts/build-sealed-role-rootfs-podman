@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+[[ $# -eq 3 ]] || { echo 'usage: scripts/build-sealed-role-rootfs-podman ROLE OUTPUT_EXT4 KERNEL' >&2; exit 2; }
+role=$1; out=$2; kernel=$3
+[[ "$out" == /* && "$out" != *..* && ! -e "$out" ]] || { echo 'output must be an unused absolute path without ..' >&2; exit 2; }
+[[ "$kernel" == /* && -f "$kernel" ]] || { echo 'kernel must be an existing absolute path' >&2; exit 2; }
+root=$(cd "$(dirname "$0")/.." && pwd)
+work=$(mktemp -d "$root/.image-build/sealed-build.XXXXXX")
+cleanup() { rm -rf "$work"; }
+trap cleanup EXIT
+mkdir -p "$(dirname -- "$out")"
+"$root/scripts/build-role-rootfs-podman" "$role" "$work/role.tar"
+"$root/scripts/tar-to-ext4" "$work/role.tar" "$out"
+"$root/scripts/seal-role-image" "$role" "$out" "$kernel"
+echo "sealed role image ready: $out"

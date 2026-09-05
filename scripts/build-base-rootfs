@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ $# -eq 1 ]] || { echo 'usage: scripts/build-base-rootfs OUTPUT_DIR' >&2; exit 2; }
+command -v debootstrap >/dev/null || { echo 'debootstrap is required' >&2; exit 1; }
+[[ "$(id -u)" -eq 0 ]] || { echo 'run as root: debootstrap needs chroot/mount privileges' >&2; exit 1; }
+out="$1"; [[ "$out" != / ]] || { echo 'refusing root output' >&2; exit 2; }
+[[ ! -e "$out" ]] || { echo "output already exists: $out" >&2; exit 1; }
+suite="trixie"
+snapshot="https://snapshot.debian.org/archive/debian/20260110T000000Z/"
+debootstrap --variant=minbase --include=ca-certificates "$suite" "$out" "$snapshot"
+printf '{"suite":"%s","snapshot":"%s","variant":"minbase"}\n' "$suite" "$snapshot" > "$out/alcatraz-base-manifest.json"
+sha256sum "$out/alcatraz-base-manifest.json" > "$out/alcatraz-base-manifest.sha256"

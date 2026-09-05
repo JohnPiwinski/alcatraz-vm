@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+command -v codex >/dev/null || { echo 'codex CLI is required' >&2; exit 1; }
+auth_status=$(codex login status 2>&1)
+grep -q 'Logged in using ChatGPT' <<<"$auth_status" || {
+  echo 'Codex is not authenticated with ChatGPT; run codex login and choose Sign in with ChatGPT' >&2
+  exit 1
+}
+tmp=$(mktemp -d /tmp/alcatraz-codex-subscriber.XXXXXX)
+cleanup() { rm -rf "$tmp"; }
+trap cleanup EXIT
+cp -R "$root/guest/codex-sample-fixture/." "$tmp/"
+codex -a never exec --ephemeral --skip-git-repo-check --sandbox workspace-write -C "$tmp" \
+  'Complete this sample project. Implement greet in src/lib.rs to return exactly "Hello, <name>!". Add useful tests and run cargo test. Do not modify files outside this project.' \
+  >"$tmp/codex.log" 2>&1
+grep -q 'cargo test' "$tmp/codex.log" || { echo 'Codex did not report running cargo test' >&2; cat "$tmp/codex.log" >&2; exit 1; }
+grep -q 'test result: ok' "$tmp/codex.log" || { echo 'Codex sample test result was not reported as successful' >&2; cat "$tmp/codex.log" >&2; exit 1; }
+! rg -q 'todo!\(\)' "$tmp/src/lib.rs" || { echo 'Codex left the sample unimplemented' >&2; exit 1; }
+cargo test --quiet --manifest-path "$tmp/Cargo.toml" >"$tmp/post-test.log" 2>&1
+grep -q 'test result: ok' "$tmp/post-test.log" || { echo 'post-Codex Cargo verification failed' >&2; cat "$tmp/post-test.log" >&2; exit 1; }
+echo 'codex subscriber: isolated sample completed; cargo test reported success'
