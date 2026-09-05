@@ -1,6 +1,7 @@
 # Generated VM images and sealed runtime artifacts
 /.image-build/
 /.runtime/
+/modules/
 
 # Local Rust build output
 /target/
